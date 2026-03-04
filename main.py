@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import threading
 from typing import Any
 
 from openai import OpenAI
@@ -62,6 +63,7 @@ class JadedRoseBot:
         self._client: OpenAI | None = None
         self._index: Any = None
         self._blocklist: Blocklist | None = None
+        self._last_update_id: int | None = None
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -116,6 +118,23 @@ class JadedRoseBot:
         )
         return response.choices[0].message.content
 
+    # -- typing indicator ------------------------------------------------------
+
+    def _start_typing(self, chat_id: int) -> threading.Event:
+        """Send typing action every 4s until the returned event is set."""
+        stop = threading.Event()
+
+        def _loop() -> None:
+            while not stop.is_set():
+                try:
+                    telegram_send_typing(chat_id)
+                except Exception:
+                    pass
+                stop.wait(4.0)
+
+        threading.Thread(target=_loop, daemon=True).start()
+        return stop
+
     # -- message handling -----------------------------------------------------
 
     def _handle_message(self, msg: dict) -> None:
@@ -127,7 +146,7 @@ class JadedRoseBot:
         sender = msg.get("sender", {})
         log.info("Message from %s (chat %s): %s", sender.get("first_name", "?"), chat_id, prompt[:80])
 
-        telegram_send_typing(chat_id)
+        typing_stop = self._start_typing(chat_id)
 
         memory = Memory(
             path=self._cfg.data_dir / f"memory_{chat_id}.json",
@@ -147,6 +166,8 @@ class JadedRoseBot:
                 chunks = self._retrieve_context(prompt)
                 log.info("Retrieved %d chunks (top score: %.3f)", len(chunks), chunks[0]["score"] if chunks else 0)
                 answer = self._generate_answer(prompt, chunks, memory)
+
+        typing_stop.set()
 
         memory.save("user", prompt)
         memory.save("assistant", answer)
@@ -171,10 +192,13 @@ class JadedRoseBot:
                 "bot_token": self._cfg.telegram_bot_token,
                 "include_existing": False,
                 "timeout_seconds": self._cfg.poll_timeout_seconds,
+                "baseline_update_id": self._last_update_id,
             })
 
             if msg is None:
                 continue
+
+            self._last_update_id = msg.get("update_id", self._last_update_id)
 
             try:
                 self._handle_message(msg)
