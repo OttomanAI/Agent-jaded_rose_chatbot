@@ -188,12 +188,19 @@ class JadedRoseBot:
 
         while self._running:
             log.info("Waiting for message (timeout %ds)…", self._cfg.poll_timeout_seconds)
-            msg = telegram_trigger({
+            trigger_cfg: dict[str, Any] = {
                 "bot_token": self._cfg.telegram_bot_token,
                 "include_existing": False,
                 "timeout_seconds": self._cfg.poll_timeout_seconds,
                 "baseline_update_id": self._last_update_id,
-            })
+            }
+            # Pass offset so Telegram confirms/discards already-processed
+            # updates server-side.  Without this the getUpdates buffer fills
+            # up and new messages are silently dropped.
+            if self._last_update_id is not None:
+                trigger_cfg["offset"] = self._last_update_id + 1
+
+            msg = telegram_trigger(trigger_cfg)
 
             if msg is None:
                 continue
