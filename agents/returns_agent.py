@@ -82,6 +82,7 @@ class ReturnsAgent:
             top_k=5,
             namespace=NS_FAQS,
             include_metadata=True,
+            filter={"type": {"$in": ["legal", "support"]}},
         )
 
         chunks: list[str] = []

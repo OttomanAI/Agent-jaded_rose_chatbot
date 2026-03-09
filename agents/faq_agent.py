@@ -80,10 +80,14 @@ class FAQAgent:
 
         chunks: list[str] = []
         for match in results.get("matches", []):
-            text = match.get("metadata", {}).get("text", "")
+            meta = match.get("metadata", {})
+            text = meta.get("text", "")
             score = match.get("score", 0)
             if text and score > 0.3:
-                chunks.append(text)
+                title = meta.get("title", "")
+                chunk_type = meta.get("type", "")
+                prefix = f"[{chunk_type}] {title}\n" if title else ""
+                chunks.append(f"{prefix}{text}")
 
         return "\n---\n".join(chunks) if chunks else ""
 

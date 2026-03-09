@@ -1,8 +1,11 @@
-"""Ingest markdown documents into Pinecone for RAG retrieval.
+"""Ingest knowledge-base documents into Pinecone for RAG retrieval.
 
-Reads every ``.md`` file in ``knowledge_base/documents/``, chunks the text
-at ~500 tokens with 50-token overlap, embeds each chunk with OpenAI
-``text-embedding-3-small``, and upserts into the ``faqs`` namespace.
+Supports two document formats:
+
+*   ``.kb`` — structured chunks with rich metadata (KB_ID, TYPE, TITLE, TAGS,
+    SOURCE, VERSION, PARENT_ID).  Preferred format.
+*   ``.md`` — plain markdown files chunked automatically at ~500 tokens with
+    50-token overlap (legacy fallback).
 
 Run as a standalone script::
 
@@ -14,9 +17,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import openai
 from pinecone import Pinecone
@@ -32,6 +36,53 @@ DOCUMENTS_DIR = Path(__file__).parent / "documents"
 CHUNK_SIZE = 500       # approximate tokens (using ~4 chars/token heuristic)
 CHUNK_OVERLAP = 50     # overlap in tokens
 CHARS_PER_TOKEN = 4    # rough estimate for English text
+
+# ---------------------------------------------------------------------------
+# Structured .kb parser
+# ---------------------------------------------------------------------------
+
+_CHUNK_DELIMITER = "--- KB_CHUNK_END ---"
+
+
+def _parse_kb_file(text: str) -> List[Dict[str, str]]:
+    """Parse a structured ``.kb`` file into a list of chunk dicts.
+
+    Each chunk dict contains keys: kb_id, type, title, tags, source, version,
+    parent_id, text.
+    """
+    raw_chunks = text.split(_CHUNK_DELIMITER)
+    parsed: List[Dict[str, str]] = []
+
+    for raw in raw_chunks:
+        raw = raw.strip()
+        if not raw:
+            continue
+
+        chunk: Dict[str, str] = {}
+        # Extract header fields (KEY: value)
+        field_pattern = re.compile(
+            r"^(KB_ID|TYPE|TITLE|TAGS|SOURCE|VERSION|PARENT_ID):\s*(.+)$",
+            re.MULTILINE,
+        )
+        for match in field_pattern.finditer(raw):
+            key = match.group(1).lower()
+            chunk[key] = match.group(2).strip()
+
+        # Extract TEXT: block — everything after "TEXT:\n"
+        text_match = re.search(r"^TEXT:\s*\n(.*)", raw, re.DOTALL | re.MULTILINE)
+        if text_match:
+            chunk["text"] = text_match.group(1).strip()
+
+        # Only include if we have at least kb_id and text
+        if chunk.get("kb_id") and chunk.get("text"):
+            parsed.append(chunk)
+
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Legacy .md chunker
+# ---------------------------------------------------------------------------
 
 
 def _chunk_text(text: str) -> List[str]:
@@ -70,6 +121,11 @@ def _chunk_text(text: str) -> List[str]:
     return chunks
 
 
+# ---------------------------------------------------------------------------
+# Embedding
+# ---------------------------------------------------------------------------
+
+
 def _embed_batch(client: openai.OpenAI, texts: List[str]) -> List[List[float]]:
     """Embed a batch of texts with OpenAI.
 
@@ -87,17 +143,100 @@ def _embed_batch(client: openai.OpenAI, texts: List[str]) -> List[List[float]]:
     return [item.embedding for item in response.data]
 
 
+# ---------------------------------------------------------------------------
+# ID generation
+# ---------------------------------------------------------------------------
+
+
 def _stable_id(source: str, index: int) -> str:
-    """Generate a deterministic vector ID for a chunk.
-
-    Args:
-        source: The source filename.
-        index: The chunk index within the file.
-
-    Returns:
-        A hex digest string.
-    """
+    """Generate a deterministic vector ID for a legacy markdown chunk."""
     return hashlib.sha256(f"{source}::{index}".encode()).hexdigest()[:16]
+
+
+def _kb_vector_id(kb_id: str) -> str:
+    """Generate a deterministic vector ID from a structured KB_ID.
+
+    Uses the KB_ID directly (truncated hash) so the same KB_ID always maps to
+    the same vector — enabling **upsert-overwrites** on re-ingestion.
+    """
+    return hashlib.sha256(kb_id.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Ingestion pipeline
+# ---------------------------------------------------------------------------
+
+
+def _prepare_kb_vectors(
+    client: openai.OpenAI, filepath: Path
+) -> List[Tuple[str, List[float], Dict[str, Any]]]:
+    """Prepare vectors from a structured .kb file."""
+    text = filepath.read_text(encoding="utf-8")
+    chunks = _parse_kb_file(text)
+    logger.info("📄 %s — %d structured chunks", filepath.name, len(chunks))
+
+    if not chunks:
+        return []
+
+    # Embed: prepend title + tags to text for richer embeddings
+    embed_texts = []
+    for c in chunks:
+        title = c.get("title", "")
+        tags = c.get("tags", "")
+        body = c.get("text", "")
+        embed_texts.append(f"{title}. {tags}. {body}")
+
+    embeddings = _embed_batch(client, embed_texts)
+
+    vectors: List[Tuple[str, List[float], Dict[str, Any]]] = []
+    for chunk, embedding in zip(chunks, embeddings):
+        vec_id = _kb_vector_id(chunk["kb_id"])
+        metadata: Dict[str, Any] = {
+            "text": chunk["text"],
+            "kb_id": chunk["kb_id"],
+            "type": chunk.get("type", ""),
+            "title": chunk.get("title", ""),
+            "tags": chunk.get("tags", ""),
+            "source": chunk.get("source", filepath.name),
+            "version": chunk.get("version", ""),
+            "parent_id": chunk.get("parent_id", "none"),
+        }
+        vectors.append((vec_id, embedding, metadata))
+
+    return vectors
+
+
+def _prepare_md_vectors(
+    client: openai.OpenAI, filepath: Path
+) -> List[Tuple[str, List[float], Dict[str, Any]]]:
+    """Prepare vectors from a legacy .md file (auto-chunked)."""
+    text = filepath.read_text(encoding="utf-8")
+    chunks = _chunk_text(text)
+    source = filepath.name
+    logger.info("📄 %s — %d auto-chunks (legacy)", source, len(chunks))
+
+    if not chunks:
+        return []
+
+    embeddings = _embed_batch(client, chunks)
+
+    vectors: List[Tuple[str, List[float], Dict[str, Any]]] = []
+    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        vec_id = _stable_id(source, i)
+        metadata: Dict[str, Any] = {
+            "text": chunk,
+            "source": source,
+            "chunk_index": i,
+            "type": "",
+            "title": "",
+            "tags": "",
+            "kb_id": "",
+            "version": "",
+            "parent_id": "none",
+        }
+        vectors.append((vec_id, embedding, metadata))
+
+    return vectors
 
 
 def ingest() -> None:
@@ -110,31 +249,32 @@ def ingest() -> None:
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index(PINECONE_INDEX)
 
+    # Prefer .kb files; fall back to .md if no .kb equivalent exists
+    kb_files = sorted(DOCUMENTS_DIR.glob("*.kb"))
     md_files = sorted(DOCUMENTS_DIR.glob("*.md"))
-    if not md_files:
-        logger.warning("No .md files found in %s", DOCUMENTS_DIR)
+
+    # Build set of basenames that have a .kb version
+    kb_basenames = {f.stem for f in kb_files}
+
+    all_vectors: List[Tuple[str, List[float], Dict[str, Any]]] = []
+
+    # Process structured .kb files first
+    for filepath in kb_files:
+        all_vectors.extend(_prepare_kb_vectors(client, filepath))
+
+    # Process .md files only if there is no .kb equivalent
+    for filepath in md_files:
+        if filepath.stem in kb_basenames:
+            logger.info("⏭️  %s — skipping (structured .kb version exists)", filepath.name)
+            continue
+        all_vectors.extend(_prepare_md_vectors(client, filepath))
+
+    if not all_vectors:
+        logger.warning("No documents found in %s", DOCUMENTS_DIR)
         return
 
-    all_vectors: List[Tuple[str, List[float], dict]] = []
-
-    for filepath in md_files:
-        source = filepath.name
-        text = filepath.read_text(encoding="utf-8")
-        chunks = _chunk_text(text)
-        logger.info("📄 %s — %d chunks", source, len(chunks))
-
-        embeddings = _embed_batch(client, chunks)
-
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            vec_id = _stable_id(source, i)
-            metadata = {
-                "text": chunk,
-                "source": source,
-                "chunk_index": i,
-            }
-            all_vectors.append((vec_id, embedding, metadata))
-
     # Upsert in batches of 100
+    # Pinecone upsert is idempotent — same vector ID overwrites the old record.
     batch_size = 100
     for i in range(0, len(all_vectors), batch_size):
         batch = all_vectors[i : i + batch_size]
@@ -145,7 +285,11 @@ def ingest() -> None:
         index.upsert(vectors=vectors, namespace=NS_FAQS)
         logger.info("Upserted batch %d–%d", i, i + len(batch))
 
-    logger.info("✅ Ingestion complete — %d vectors upserted to '%s'", len(all_vectors), NS_FAQS)
+    logger.info(
+        "✅ Ingestion complete — %d vectors upserted to '%s'",
+        len(all_vectors),
+        NS_FAQS,
+    )
 
 
 if __name__ == "__main__":
