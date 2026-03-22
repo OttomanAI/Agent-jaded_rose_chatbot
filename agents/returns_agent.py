@@ -19,6 +19,7 @@ from pinecone import Pinecone
 logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o")
 PINECONE_API_KEY: str = os.getenv("PINECONE_API_KEY", "")
 PINECONE_INDEX: str = os.getenv("PINECONE_INDEX", "jaded-rose")
 NS_FAQS: str = "faqs"
@@ -135,7 +136,7 @@ class ReturnsAgent:
         messages.append({"role": "user", "content": message})
 
         response = await self._openai.chat.completions.create(
-            model="gpt-4o",
+            model=OPENAI_MODEL,
             temperature=0.2,
             messages=messages,
         )

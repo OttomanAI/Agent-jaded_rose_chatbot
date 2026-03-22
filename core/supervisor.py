@@ -21,6 +21,7 @@ from core.escalation import EscalationManager
 logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 # ── Intent constants ────────────────────────────────────────────────────
 ORDER_TRACKING = "ORDER_TRACKING"
@@ -135,7 +136,7 @@ class Supervisor:
 
         try:
             response = await self._openai.chat.completions.create(
-                model="gpt-4o",
+                model=OPENAI_MODEL,
                 temperature=0.0,
                 messages=[
                     {"role": "system", "content": _CLASSIFICATION_SYSTEM_PROMPT},
