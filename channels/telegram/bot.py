@@ -7,11 +7,13 @@ generation.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import List
 
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -95,6 +97,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     logger.info("Telegram message from %s: %s", session_id, user_message[:120])
 
+    # Send "typing..." indicator until the response is ready
+    async def _keep_typing():
+        try:
+            while True:
+                await update.effective_chat.send_action(ChatAction.TYPING)  # type: ignore[union-attr]
+                await asyncio.sleep(4)  # Typing status expires after ~5s
+        except asyncio.CancelledError:
+            pass
+
+    typing_task = asyncio.create_task(_keep_typing())
+
     try:
         response = await _supervisor.process(
             message=user_message,
@@ -107,6 +120,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Sorry, something went wrong on our end. "
             "Please try again in a moment or email us at support@jadedrose.com 💌"
         )
+    finally:
+        typing_task.cancel()
 
     for chunk in _split_message(response):
         await update.message.reply_text(chunk, parse_mode="Markdown")
