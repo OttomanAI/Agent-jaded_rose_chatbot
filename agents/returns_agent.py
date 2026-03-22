@@ -137,7 +137,6 @@ class ReturnsAgent:
 
         response = await self._openai.chat.completions.create(
             model=OPENAI_MODEL,
-            temperature=0.2,
             messages=messages,
         )
 

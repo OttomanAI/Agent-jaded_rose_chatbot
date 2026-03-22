@@ -137,7 +137,6 @@ class Supervisor:
         try:
             response = await self._openai.chat.completions.create(
                 model=OPENAI_MODEL,
-                temperature=0.0,
                 messages=[
                     {"role": "system", "content": _CLASSIFICATION_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
